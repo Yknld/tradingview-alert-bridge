@@ -1,0 +1,6 @@
+fastapi==0.122.0
+uvicorn[standard]==0.38.0
+pydantic==2.12.4
+httpx==0.28.1
+twilio==9.8.7
+python-dotenv==1.2.1
