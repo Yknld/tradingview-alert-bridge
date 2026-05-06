@@ -20,7 +20,11 @@ def build_message(payload: dict[str, Any]) -> str:
     price = payload.get("price", "unknown price")
     timeframe = payload.get("timeframe", "unknown timeframe")
     strategy = payload.get("strategy", "strategy")
-    return f"{strategy}. {symbol}. {side}. Price {price}. Timeframe {timeframe}."
+    event = payload.get("event", "ALERT")
+    trigger_price = payload.get("trigger_price")
+    if trigger_price not in (None, ""):
+        return f"{strategy}. {event}. {symbol}. {side}. Price {price}. Trigger {trigger_price}. Timeframe {timeframe}."
+    return f"{strategy}. {event}. {symbol}. {side}. Price {price}. Timeframe {timeframe}."
 
 
 def get_cooldown_minutes() -> int:
@@ -34,7 +38,9 @@ def get_cooldown_minutes() -> int:
 def build_cooldown_key(payload: dict[str, Any]) -> str:
     symbol = str(payload.get("symbol", "unknown symbol")).upper()
     side = str(payload.get("side", "unknown side")).upper()
-    return f"{symbol}|{side}"
+    notify = str(payload.get("notify", "call_sms")).upper()
+    event = str(payload.get("event", "ALERT")).upper()
+    return f"{symbol}|{side}|{notify}|{event}"
 
 
 def get_cooldown_status(payload: dict[str, Any]) -> dict[str, Any]:
@@ -79,13 +85,23 @@ def get_twilio_client() -> Client | None:
     return Client(account_sid, auth_token)
 
 
-def maybe_send_call_and_sms(message: str) -> dict[str, str | None]:
+def maybe_send_notifications(message: str, payload: dict[str, Any]) -> dict[str, str | None]:
     client = get_twilio_client()
     from_number = os.getenv("TWILIO_FROM_NUMBER")
     to_number = os.getenv("ALERT_TO_NUMBER")
 
     if client is None or not from_number or not to_number:
-        return {"call_sid": None, "sms_sid": None}
+        return {"mode": None, "call_sid": None, "sms_sid": None}
+
+    notify_mode = str(payload.get("notify", "call_sms")).lower()
+
+    if notify_mode == "sms_only":
+        sms = client.messages.create(
+            to=to_number,
+            from_=from_number,
+            body=message,
+        )
+        return {"mode": notify_mode, "call_sid": None, "sms_sid": sms.sid}
 
     call = client.calls.create(
         to=to_number,
@@ -97,7 +113,7 @@ def maybe_send_call_and_sms(message: str) -> dict[str, str | None]:
         from_=from_number,
         body=message,
     )
-    return {"call_sid": call.sid, "sms_sid": sms.sid}
+    return {"mode": notify_mode, "call_sid": call.sid, "sms_sid": sms.sid}
 
 
 @app.get("/health")
@@ -118,9 +134,9 @@ def tradingview_webhook(payload: dict[str, Any]) -> dict[str, Any]:
     cooldown = get_cooldown_status(payload)
     suppressed = not cooldown["allowed"]
     if suppressed:
-        delivery = {"call_sid": None, "sms_sid": None}
+        delivery = {"mode": payload.get("notify", "call_sms"), "call_sid": None, "sms_sid": None}
     else:
-        delivery = maybe_send_call_and_sms(message)
+        delivery = maybe_send_notifications(message, payload)
         last_delivery_by_key[cooldown["key"]] = datetime.now(timezone.utc)
     last_alert = {
         "payload": payload,
