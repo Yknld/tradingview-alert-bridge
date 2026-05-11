@@ -20,6 +20,7 @@ positions_by_id: dict[str, dict[str, Any]] = {}
 runtime_settings: dict[str, Any] = {
     "execution_enabled": os.getenv("EXECUTION_ENABLED", "true").lower() == "true",
     "max_open_positions": int(os.getenv("MAX_OPEN_POSITIONS", "2")),
+    "max_open_contracts_per_account": int(os.getenv("MAX_OPEN_CONTRACTS_PER_ACCOUNT", "3")),
     "min_risk_dollars": float(os.getenv("MIN_RISK_DOLLARS", "300")),
     "max_risk_dollars": float(os.getenv("MAX_RISK_DOLLARS", "500")),
     "auto_submit_stop_loss": os.getenv("AUTO_SUBMIT_STOP_LOSS", "true").lower() == "true",
@@ -57,6 +58,7 @@ def get_runtime_settings() -> dict[str, Any]:
     return {
         "execution_enabled": bool(runtime_settings["execution_enabled"]),
         "max_open_positions": int(runtime_settings["max_open_positions"]),
+        "max_open_contracts_per_account": max(1, int(runtime_settings["max_open_contracts_per_account"])),
         "min_risk_dollars": float(runtime_settings["min_risk_dollars"]),
         "max_risk_dollars": float(runtime_settings["max_risk_dollars"]),
         "auto_submit_stop_loss": bool(runtime_settings["auto_submit_stop_loss"]),
@@ -75,6 +77,10 @@ def active_positions() -> list[dict[str, Any]]:
     ]
 
 
+def active_per_account_contracts() -> int:
+    return sum(int(position.get("per_account_quantity", 0)) for position in active_positions())
+
+
 def validate_risk_limits(request_payload: dict[str, Any]) -> None:
     settings = get_runtime_settings()
     risk_dollars = float(request_payload["risk_dollars"])
@@ -88,7 +94,7 @@ def validate_risk_limits(request_payload: dict[str, Any]) -> None:
         )
 
 
-def validate_trade_capacity(request_payload: dict[str, Any]) -> None:
+def validate_trade_capacity(request_payload: dict[str, Any], plan: dict[str, Any]) -> None:
     if not is_entry_job(request_payload):
         return
     settings = get_runtime_settings()
@@ -99,6 +105,17 @@ def validate_trade_capacity(request_payload: dict[str, Any]) -> None:
             detail=(
                 f"Active trade limit reached ({active_count}/{settings['max_open_positions']}). "
                 "Close a position before opening another."
+            ),
+        )
+    current_per_account_contracts = active_per_account_contracts()
+    projected_per_account_contracts = current_per_account_contracts + int(plan["per_account_quantity"])
+    if projected_per_account_contracts > settings["max_open_contracts_per_account"]:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Open contract limit per account would be exceeded "
+                f"({projected_per_account_contracts}/{settings['max_open_contracts_per_account']}). "
+                "Close or reduce positions before opening another."
             ),
         )
 
@@ -374,8 +391,9 @@ def create_execution_job(
         raise HTTPException(status_code=409, detail="Execution is currently disabled")
     if enforce_entry_guards:
         validate_risk_limits(request_payload)
-        validate_trade_capacity(request_payload)
     plan = compute_execution_plan(request_payload)
+    if enforce_entry_guards:
+        validate_trade_capacity(request_payload, plan)
     job_id = str(uuid.uuid4())
     job = {
         "job_id": job_id,
@@ -545,6 +563,7 @@ def render_dashboard_html() -> str:
     positions = sorted(positions_by_id.values(), key=lambda position: position["created_at"], reverse=True)
     jobs = sorted(jobs_by_id.values(), key=lambda job: job["created_at"], reverse=True)[:20]
     active_count = len(active_positions())
+    active_contract_count = active_per_account_contracts()
 
     position_rows = []
     for position in positions:
@@ -617,6 +636,7 @@ def render_dashboard_html() -> str:
             <p>Execution: {render_bool_badge(settings['execution_enabled'], 'Enabled', 'Disabled')}</p>
             <p>Auto stop-loss: {render_bool_badge(settings['auto_submit_stop_loss'], 'Enabled', 'Disabled')}</p>
             <p>Active positions: <strong>{active_count}</strong> / {settings['max_open_positions']}</p>
+            <p>Open contracts per account: <strong>{active_contract_count}</strong> / <strong>{settings['max_open_contracts_per_account']}</strong></p>
             <p>Mirrored accounts: <strong>{settings['mirrored_account_count']}</strong></p>
             <p>Allowed risk per trade: <strong>{settings['min_risk_dollars']:.0f}</strong> to <strong>{settings['max_risk_dollars']:.0f}</strong> per account</p>
           </section>
@@ -635,6 +655,8 @@ def render_dashboard_html() -> str:
               </select>
               <label for='max_open_positions'>Max open positions</label>
               <input type='number' min='1' step='1' name='max_open_positions' id='max_open_positions' value='{settings['max_open_positions']}' />
+              <label for='max_open_contracts_per_account'>Max open contracts per account</label>
+              <input type='number' min='1' step='1' name='max_open_contracts_per_account' id='max_open_contracts_per_account' value='{settings['max_open_contracts_per_account']}' />
               <label for='min_risk_dollars'>Min risk dollars</label>
               <input type='number' min='0' step='1' name='min_risk_dollars' id='min_risk_dollars' value='{settings['min_risk_dollars']:.0f}' />
               <label for='max_risk_dollars'>Max risk dollars</label>
@@ -687,6 +709,7 @@ def update_dashboard_settings(
     execution_enabled: str = Form(...),
     auto_submit_stop_loss: str = Form(...),
     max_open_positions: int = Form(...),
+    max_open_contracts_per_account: int = Form(...),
     min_risk_dollars: float = Form(...),
     max_risk_dollars: float = Form(...),
     mirrored_account_count: int = Form(...),
@@ -694,6 +717,7 @@ def update_dashboard_settings(
     runtime_settings["execution_enabled"] = execution_enabled.lower() == "true"
     runtime_settings["auto_submit_stop_loss"] = auto_submit_stop_loss.lower() == "true"
     runtime_settings["max_open_positions"] = max(1, int(max_open_positions))
+    runtime_settings["max_open_contracts_per_account"] = max(1, int(max_open_contracts_per_account))
     runtime_settings["min_risk_dollars"] = max(0.0, float(min_risk_dollars))
     runtime_settings["max_risk_dollars"] = max(float(max_risk_dollars), runtime_settings["min_risk_dollars"])
     runtime_settings["mirrored_account_count"] = max(1, int(mirrored_account_count))
