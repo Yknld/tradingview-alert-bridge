@@ -23,6 +23,7 @@ runtime_settings: dict[str, Any] = {
     "min_risk_dollars": float(os.getenv("MIN_RISK_DOLLARS", "300")),
     "max_risk_dollars": float(os.getenv("MAX_RISK_DOLLARS", "500")),
     "auto_submit_stop_loss": os.getenv("AUTO_SUBMIT_STOP_LOSS", "true").lower() == "true",
+    "mirrored_account_count": int(os.getenv("MIRRORED_ACCOUNT_COUNT", "2")),
 }
 
 PRODUCT_SPECS: dict[str, dict[str, float]] = {
@@ -59,6 +60,7 @@ def get_runtime_settings() -> dict[str, Any]:
         "min_risk_dollars": float(runtime_settings["min_risk_dollars"]),
         "max_risk_dollars": float(runtime_settings["max_risk_dollars"]),
         "auto_submit_stop_loss": bool(runtime_settings["auto_submit_stop_loss"]),
+        "mirrored_account_count": max(1, int(runtime_settings["mirrored_account_count"])),
     }
 
 
@@ -115,9 +117,12 @@ def build_position_from_job(job: dict[str, Any]) -> dict[str, Any]:
         "symbol": request_payload["symbol"],
         "side": request_payload["side"],
         "quantity": plan["quantity"],
+        "per_account_quantity": plan["per_account_quantity"],
+        "mirrored_account_count": plan["mirrored_account_count"],
         "entry_price": plan["entry_price"],
         "effective_stop_price": plan["effective_stop_price"],
         "risk_dollars": plan["risk_dollars"],
+        "total_risk_dollars": plan["total_risk_dollars"],
         "risk_per_contract": plan["risk_per_contract"],
         "source_job_id": job["job_id"],
         "stop_job_id": None,
@@ -297,6 +302,7 @@ def compute_execution_plan(request_payload: dict[str, Any]) -> dict[str, Any]:
     disaster_stop_price = None if disaster_stop_price_raw in (None, "") else float(disaster_stop_price_raw)
     risk_dollars = float(request_payload["risk_dollars"])
     max_contracts = int(request_payload["max_contracts"])
+    mirrored_account_count = max(1, int(get_runtime_settings()["mirrored_account_count"]))
 
     root = normalize_symbol_root(symbol)
     specs = PRODUCT_SPECS[root]
@@ -308,7 +314,8 @@ def compute_execution_plan(request_payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Calculated risk per contract must be positive")
 
     qty_by_risk = int(risk_dollars // risk_per_contract)
-    quantity = max(min(qty_by_risk, max_contracts), 0)
+    per_account_quantity = max(min(qty_by_risk, max_contracts), 0)
+    quantity = per_account_quantity * mirrored_account_count
 
     return {
         "symbol_root": root,
@@ -321,7 +328,10 @@ def compute_execution_plan(request_payload: dict[str, Any]) -> dict[str, Any]:
         "stop_distance_ticks": stop_distance_ticks,
         "risk_per_contract": risk_per_contract,
         "risk_dollars": risk_dollars,
+        "total_risk_dollars": risk_dollars * mirrored_account_count,
         "max_contracts": max_contracts,
+        "per_account_quantity": per_account_quantity,
+        "mirrored_account_count": mirrored_account_count,
         "quantity": quantity,
         "tick_size": specs["tick_size"],
         "tick_value": specs["tick_value"],
@@ -523,8 +533,8 @@ def render_dashboard_html() -> str:
             f"<td>{escape(position['position_id'][:8])}</td>"
             f"<td>{escape(position['symbol'])}</td>"
             f"<td>{escape(position['side'])}</td>"
-            f"<td>{position['quantity']}</td>"
-            f"<td>{position['risk_dollars']:.2f}</td>"
+            f"<td>{position['quantity']} total / {position['per_account_quantity']} acct</td>"
+            f"<td>{position['risk_dollars']:.2f} acct / {position['total_risk_dollars']:.2f} total</td>"
             f"<td>{position['effective_stop_price']:.5f}</td>"
             f"<td>{escape(position['status'])}</td>"
             f"<td>{escape(position['created_at'])}</td>"
@@ -580,7 +590,8 @@ def render_dashboard_html() -> str:
             <p>Execution: {render_bool_badge(settings['execution_enabled'], 'Enabled', 'Disabled')}</p>
             <p>Auto stop-loss: {render_bool_badge(settings['auto_submit_stop_loss'], 'Enabled', 'Disabled')}</p>
             <p>Active positions: <strong>{active_count}</strong> / {settings['max_open_positions']}</p>
-            <p>Allowed risk per trade: <strong>{settings['min_risk_dollars']:.0f}</strong> to <strong>{settings['max_risk_dollars']:.0f}</strong></p>
+            <p>Mirrored accounts: <strong>{settings['mirrored_account_count']}</strong></p>
+            <p>Allowed risk per trade: <strong>{settings['min_risk_dollars']:.0f}</strong> to <strong>{settings['max_risk_dollars']:.0f}</strong> per account</p>
           </section>
           <section class='card'>
             <h2>Controls</h2>
@@ -601,6 +612,8 @@ def render_dashboard_html() -> str:
               <input type='number' min='0' step='1' name='min_risk_dollars' id='min_risk_dollars' value='{settings['min_risk_dollars']:.0f}' />
               <label for='max_risk_dollars'>Max risk dollars</label>
               <input type='number' min='0' step='1' name='max_risk_dollars' id='max_risk_dollars' value='{settings['max_risk_dollars']:.0f}' />
+              <label for='mirrored_account_count'>Mirrored account count</label>
+              <input type='number' min='1' step='1' name='mirrored_account_count' id='mirrored_account_count' value='{settings['mirrored_account_count']}' />
               <div style='margin-top:12px'><button type='submit'>Save Settings</button></div>
             </form>
           </section>
@@ -649,12 +662,14 @@ def update_dashboard_settings(
     max_open_positions: int = Form(...),
     min_risk_dollars: float = Form(...),
     max_risk_dollars: float = Form(...),
+    mirrored_account_count: int = Form(...),
 ) -> RedirectResponse:
     runtime_settings["execution_enabled"] = execution_enabled.lower() == "true"
     runtime_settings["auto_submit_stop_loss"] = auto_submit_stop_loss.lower() == "true"
     runtime_settings["max_open_positions"] = max(1, int(max_open_positions))
     runtime_settings["min_risk_dollars"] = max(0.0, float(min_risk_dollars))
     runtime_settings["max_risk_dollars"] = max(float(max_risk_dollars), runtime_settings["min_risk_dollars"])
+    runtime_settings["mirrored_account_count"] = max(1, int(mirrored_account_count))
     return RedirectResponse(url="/dashboard", status_code=303)
 
 
