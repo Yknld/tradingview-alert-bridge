@@ -262,10 +262,13 @@ def maybe_send_notifications(message: str, payload: dict[str, Any]) -> dict[str,
     from_number = os.getenv("TWILIO_FROM_NUMBER")
     to_number = os.getenv("ALERT_TO_NUMBER")
 
+    notify_mode = str(payload.get("notify", "call_sms")).lower()
+
+    if notify_mode in {"silent", "none"}:
+        return {"mode": notify_mode, "call_sid": None, "sms_sid": None}
+
     if client is None or not from_number or not to_number:
         return {"mode": None, "call_sid": None, "sms_sid": None}
-
-    notify_mode = str(payload.get("notify", "call_sms")).lower()
 
     if notify_mode == "sms_only":
         sms = client.messages.create(
