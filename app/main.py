@@ -279,8 +279,22 @@ def normalize_symbol_root(symbol: str) -> str:
     return sorted(matches, key=len, reverse=True)[0]
 
 
-def choose_effective_stop(side: str, entry_price: float, natural_stop_price: float, disaster_stop_price: float | None) -> float:
+def parse_optional_price(raw_value: Any) -> float | None:
+    if raw_value in (None, "", "0", "0.0"):
+        return None
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def choose_effective_stop(side: str, entry_price: float, natural_stop_price: float | None, disaster_stop_price: float | None) -> float:
     side_upper = side.upper()
+    if natural_stop_price is None and disaster_stop_price is None:
+        raise HTTPException(status_code=400, detail="At least one stop price must be provided")
+    if natural_stop_price is None:
+        return disaster_stop_price  # type: ignore[return-value]
     if disaster_stop_price is None:
         return natural_stop_price
     if side_upper == "LONG":
@@ -297,9 +311,8 @@ def compute_execution_plan(request_payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="side must be LONG or SHORT")
 
     entry_price = float(request_payload["entry_price"])
-    natural_stop_price = float(request_payload["natural_stop_price"])
-    disaster_stop_price_raw = request_payload.get("disaster_stop_price")
-    disaster_stop_price = None if disaster_stop_price_raw in (None, "") else float(disaster_stop_price_raw)
+    natural_stop_price = parse_optional_price(request_payload.get("natural_stop_price"))
+    disaster_stop_price = parse_optional_price(request_payload.get("disaster_stop_price"))
     risk_dollars = float(request_payload["risk_dollars"])
     max_contracts = int(request_payload["max_contracts"])
     mirrored_account_count = max(1, int(get_runtime_settings()["mirrored_account_count"]))
@@ -375,8 +388,10 @@ def create_execution_job(
 
 def maybe_enqueue_execution_job(payload: dict[str, Any]) -> dict[str, Any] | None:
     execute = bool(payload.get("execute", False))
-    required_fields = {"entry_price", "natural_stop_price", "risk_dollars", "max_contracts"}
+    required_fields = {"entry_price", "risk_dollars", "max_contracts"}
     if not execute or not required_fields.issubset(payload.keys()):
+        return None
+    if parse_optional_price(payload.get("natural_stop_price")) is None and parse_optional_price(payload.get("disaster_stop_price")) is None:
         return None
     return create_execution_job(payload, source="tradingview_webhook")
 
