@@ -1,11 +1,13 @@
 import os
 import re
+import subprocess
 import time
 from typing import Any
 
 import httpx
 from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext, Page, sync_playwright
+from AppKit import NSScreen
 
 load_dotenv()
 
@@ -43,25 +45,309 @@ class RailwayClient:
 
 
 class TradovateExecutor:
-    def __init__(self, tradovate_url: str, user_data_dir: str, dry_run: bool, username: str | None, password: str | None) -> None:
+    def __init__(
+        self,
+        tradovate_url: str,
+        user_data_dir: str,
+        dry_run: bool,
+        username: str | None,
+        password: str | None,
+        prepare_only: bool,
+        stop_menu_click_x: float | None,
+        stop_menu_click_y: float | None,
+    ) -> None:
         self.tradovate_url = tradovate_url
         self.user_data_dir = user_data_dir
         self.dry_run = dry_run
         self.username = username
         self.password = password
+        self.prepare_only = prepare_only
+        self.stop_menu_click_x = stop_menu_click_x
+        self.stop_menu_click_y = stop_menu_click_y
         self.playwright = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
 
+    @staticmethod
+    def _opposite_side(side: str) -> str:
+        side_upper = side.upper()
+        if side_upper == "LONG":
+            return "SHORT"
+        if side_upper == "SHORT":
+            return "LONG"
+        raise RuntimeError(f"Unsupported side for stop handling: {side}")
+
+    @staticmethod
+    def _price_decimals(tick_size: float) -> int:
+        tick_text = f"{tick_size:.10f}".rstrip("0").rstrip(".")
+        if "." not in tick_text:
+            return 0
+        return len(tick_text.split(".")[1])
+
+    def _format_price(self, price: float, tick_size: float) -> str:
+        decimals = self._price_decimals(tick_size)
+        return f"{price:.{decimals}f}"
+
+    def _native_stop_order_shortcut(self) -> bool:
+        applescript = """
+        tell application "Chromium" to activate
+        delay 0.15
+        tell application "System Events"
+            key code 125
+            delay 0.08
+            key code 125
+            delay 0.08
+            key code 125
+            delay 0.08
+            key code 36
+        end tell
+        """
+        try:
+            print("Trying native macOS STOP shortcut via osascript", flush=True)
+            completed = subprocess.run(
+                ["osascript", "-e", applescript],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if completed.returncode != 0:
+                stderr = (completed.stderr or "").strip()
+                print(f"osascript STOP shortcut failed: {stderr}", flush=True)
+                return False
+            time.sleep(0.6)
+            return True
+        except Exception as exc:
+            print(f"Native STOP shortcut raised exception: {exc}", flush=True)
+            return False
+
+    def _native_cliclick(self, *commands: str) -> bool:
+        try:
+            completed = subprocess.run(
+                ["/opt/homebrew/bin/cliclick", "-w", "80", *commands],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if completed.returncode != 0:
+                stderr = (completed.stderr or "").strip()
+                print(f"cliclick failed: {stderr}", flush=True)
+                return False
+            return True
+        except Exception as exc:
+            print(f"cliclick raised exception: {exc}", flush=True)
+            return False
+
+    def _activate_chromium(self) -> None:
+        applescript = """
+        tell application "Chromium" to activate
+        """
+        try:
+            subprocess.run(
+                ["osascript", "-e", applescript],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            pass
+
+    def _native_click_point(self, x: float, y: float) -> bool:
+        self._activate_chromium()
+        time.sleep(0.2)
+        return self._native_cliclick(
+            f"m:{int(x)},{int(y)}",
+            f"c:{int(x)},{int(y)}",
+        )
+
+    def _screen_height(self) -> int | None:
+        try:
+            screen = NSScreen.mainScreen()
+            if screen is None:
+                return None
+            frame = screen.frame()
+            return int(frame.size.height)
+        except Exception:
+            return None
+
+    def _dom_click_at(self, x: float, y: float) -> bool:
+        if self.page is None:
+            return False
+        try:
+            return bool(
+                self.page.evaluate(
+                    """
+                    ([x, y]) => {
+                      const el = document.elementFromPoint(x, y);
+                      if (!el) return false;
+                      const events = ["pointerdown", "mousedown", "pointerup", "mouseup", "click"];
+                      for (const type of events) {
+                        const evt = new MouseEvent(type, {
+                          bubbles: true,
+                          cancelable: true,
+                          composed: true,
+                          clientX: x,
+                          clientY: y,
+                          button: 0,
+                          buttons: 1,
+                          view: window
+                        });
+                        el.dispatchEvent(evt);
+                      }
+                      return true;
+                    }
+                    """,
+                    [x, y],
+                )
+            )
+        except Exception:
+            return False
+
+    def _dom_select_stop_menu_item(self, min_y: float) -> bool:
+        if self.page is None:
+            return False
+        try:
+            result = self.page.evaluate(
+                """
+                ({ minY }) => {
+                  function isVisible(el) {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
+                  }
+
+                  function normalizedText(el) {
+                    return ((el.innerText || el.textContent || "").trim().replace(/\\s+/g, " "));
+                  }
+
+                  function clickableAncestor(el) {
+                    let cur = el;
+                    while (cur && cur !== document.body) {
+                      const role = cur.getAttribute?.("role") || "";
+                      const tag = (cur.tagName || "").toUpperCase();
+                      const onclick = typeof cur.onclick === "function";
+                      if (
+                        tag === "A" ||
+                        tag === "BUTTON" ||
+                        tag === "LI" ||
+                        role === "option" ||
+                        role === "menuitem" ||
+                        onclick
+                      ) {
+                        return cur;
+                      }
+                      cur = cur.parentElement;
+                    }
+                    return el;
+                  }
+
+                  function clickLikeUser(el) {
+                    const rect = el.getBoundingClientRect();
+                    const x = rect.x + rect.width / 2;
+                    const y = rect.y + rect.height / 2;
+                    const events = ["pointerover", "mouseover", "pointerenter", "mouseenter", "pointermove", "mousemove", "pointerdown", "mousedown", "pointerup", "mouseup", "click"];
+                    for (const type of events) {
+                      const evt = new MouseEvent(type, {
+                        bubbles: true,
+                        cancelable: true,
+                        composed: true,
+                        clientX: x,
+                        clientY: y,
+                        button: 0,
+                        buttons: 1,
+                        view: window
+                      });
+                      el.dispatchEvent(evt);
+                    }
+                    if (typeof el.focus === "function") el.focus();
+                    if (typeof el.click === "function") el.click();
+                    return { x, y };
+                  }
+
+                  const all = Array.from(document.querySelectorAll("*"));
+                  const candidates = [];
+                  for (const el of all) {
+                    if (!isVisible(el)) continue;
+                    if (normalizedText(el) !== "STOP") continue;
+                    const clickable = clickableAncestor(el);
+                    if (!isVisible(clickable)) continue;
+                    const rect = clickable.getBoundingClientRect();
+                    if (rect.y <= minY + 20) continue;
+                    candidates.push({
+                      textTag: el.tagName,
+                      clickTag: clickable.tagName,
+                      role: clickable.getAttribute?.("role") || "",
+                      className: clickable.className || "",
+                      x: rect.x,
+                      y: rect.y,
+                      width: rect.width,
+                      height: rect.height,
+                      bg: window.getComputedStyle(clickable).backgroundColor || ""
+                    });
+                  }
+
+                  candidates.sort((a, b) => a.y - b.y);
+                  if (candidates.length === 0) {
+                    return { ok: false, candidates: [] };
+                  }
+
+                  const chosenMeta = candidates[0];
+                  const chosen = all.find((el) => {
+                    if (!isVisible(el)) return false;
+                    if (normalizedText(el) !== "STOP") return false;
+                    const clickable = clickableAncestor(el);
+                    const rect = clickable.getBoundingClientRect();
+                    return (
+                      Math.abs(rect.x - chosenMeta.x) < 1 &&
+                      Math.abs(rect.y - chosenMeta.y) < 1 &&
+                      Math.abs(rect.width - chosenMeta.width) < 1 &&
+                      Math.abs(rect.height - chosenMeta.height) < 1
+                    );
+                  });
+                  const clickable = clickableAncestor(chosen);
+                  const clicked = clickLikeUser(clickable);
+                  return { ok: true, chosen: chosenMeta, clicked, candidates };
+                }
+                """,
+                {"minY": min_y},
+            )
+            if isinstance(result, dict):
+                candidates = result.get("candidates", [])
+                if candidates:
+                    print(f"DOM STOP candidates: {candidates}", flush=True)
+                if result.get("ok"):
+                    chosen = result.get("chosen", {})
+                    clicked = result.get("clicked", {})
+                    print(
+                        "DOM STOP chose "
+                        f"tag={chosen.get('clickTag')} role={chosen.get('role')} "
+                        f"class={chosen.get('className')} rect=({chosen.get('x')}, {chosen.get('y')}, {chosen.get('width')}, {chosen.get('height')}) "
+                        f"clicked=({clicked.get('x')}, {clicked.get('y')})",
+                        flush=True,
+                    )
+                    return True
+            return False
+        except Exception:
+            return False
+
     def start(self) -> None:
+        print("Starting Playwright persistent browser...", flush=True)
         self.playwright = sync_playwright().start()
         self.context = self.playwright.chromium.launch_persistent_context(
             self.user_data_dir,
             headless=False,
+            args=["--hide-crash-restore-bubble"],
         )
         pages = self.context.pages
         self.page = pages[0] if pages else self.context.new_page()
         self.page.goto(self.tradovate_url, wait_until="domcontentloaded")
+        print(f"Opened Tradovate at {self.tradovate_url}", flush=True)
+        self.maybe_login()
+        self.maybe_select_simulation()
 
     def stop(self) -> None:
         if self.context is not None:
@@ -72,14 +358,33 @@ class TradovateExecutor:
     def ensure_tradovate_ready(self) -> None:
         if self.page is None:
             raise RuntimeError("Browser page is not initialized")
+        print("Refreshing Tradovate page state...", flush=True)
         self.page.goto(self.tradovate_url, wait_until="domcontentloaded")
         self.maybe_login()
+        self.maybe_select_simulation()
+        self.maybe_open_trading_ticket()
 
     def is_login_page(self) -> bool:
         if self.page is None:
             return False
         try:
-            return self.page.locator("input[type='password']").first.is_visible(timeout=2000)
+            url = self.page.url.lower()
+            password_visible = self.page.locator("input[type='password']").count() > 0 and self.page.locator("input[type='password']").first.is_visible()
+            username_text_visible = self.page.get_by_text(re.compile("username", re.I)).count() > 0
+            welcome_text_visible = self.page.get_by_text(re.compile("welcome back", re.I)).count() > 0
+            login_button_visible = self.page.get_by_role("button", name=re.compile("login", re.I)).count() > 0
+            welcome_url = "/welcome" in url
+            detected = password_visible or (username_text_visible and login_button_visible) or welcome_text_visible or welcome_url
+            print(
+                f"Login detection | password_visible={password_visible} "
+                f"username_text_visible={username_text_visible} "
+                f"welcome_text_visible={welcome_text_visible} "
+                f"login_button_visible={login_button_visible} "
+                f"welcome_url={welcome_url} "
+                f"url={self.page.url}",
+                flush=True,
+            )
+            return detected
         except Exception:
             return False
 
@@ -87,17 +392,31 @@ class TradovateExecutor:
         if self.page is None:
             raise RuntimeError("Browser page is not initialized")
         if not self.is_login_page():
+            print("Tradovate login page not detected; assuming active session.", flush=True)
             return
         if not self.username or not self.password:
             raise RuntimeError("Tradovate login required but TRADOVATE_USERNAME/TRADOVATE_PASSWORD are not set")
 
-        username_input = self.page.get_by_label(re.compile("username|email", re.I))
-        password_input = self.page.locator("input[type='password']").first
-        if username_input.count() == 0:
-            username_input = self.page.locator("input[type='text'], input:not([type])").first
+        print("Tradovate login page detected; attempting login...", flush=True)
+        if "/welcome" in self.page.url.lower():
+            self.page.wait_for_load_state("domcontentloaded")
+            time.sleep(1)
+        if self.page.get_by_role("button", name=re.compile("accept cookies", re.I)).count() > 0:
+            cookie_button = self.page.get_by_role("button", name=re.compile("accept cookies", re.I)).first
+            try:
+                cookie_button.scroll_into_view_if_needed(timeout=2_000)
+                cookie_button.click(timeout=2_000, force=True)
+                print("Accepted cookies banner", flush=True)
+            except Exception as exc:
+                print(f"Could not click cookie banner cleanly, continuing anyway: {exc}", flush=True)
 
-        username_input.first.fill(self.username)
-        password_input.fill(self.password)
+        username_locator = self.page.locator("input[type='text'], input[type='email'], input:not([type])").first
+        password_locator = self.page.locator("input[type='password']").first
+
+        username_locator.click()
+        username_locator.fill(self.username)
+        password_locator.click()
+        password_locator.fill(self.password)
         self.page.get_by_role("button", name=re.compile("login", re.I)).first.click()
         self.page.wait_for_load_state("domcontentloaded")
 
@@ -110,13 +429,625 @@ class TradovateExecutor:
 
         raise RuntimeError("Tradovate login did not complete; manual intervention may be required")
 
+    def is_trading_mode_page(self) -> bool:
+        if self.page is None:
+            return False
+        try:
+            heading_visible = self.page.get_by_text(re.compile("select a trading mode", re.I)).count() > 0
+            sim_button_visible = self.page.get_by_role(
+                "button",
+                name=re.compile("access simulation|start simulated trading", re.I),
+            ).count() > 0
+            detected = heading_visible or sim_button_visible or "trading-mode" in self.page.url.lower()
+            print(
+                f"Trading mode detection | heading_visible={heading_visible} "
+                f"sim_button_visible={sim_button_visible} url={self.page.url}",
+                flush=True,
+            )
+            return detected
+        except Exception:
+            return False
+
+    def maybe_select_simulation(self) -> None:
+        if self.page is None:
+            raise RuntimeError("Browser page is not initialized")
+        if not self.is_trading_mode_page():
+            return
+
+        print("Tradovate trading mode page detected; selecting Simulation...", flush=True)
+        self.page.get_by_role(
+            "button",
+            name=re.compile("access simulation|start simulated trading", re.I),
+        ).first.click()
+        self.page.wait_for_load_state("domcontentloaded")
+
+        for _ in range(15):
+            if not self.is_trading_mode_page():
+                print("Tradovate simulation mode selected", flush=True)
+                return
+            time.sleep(1)
+
+        raise RuntimeError("Tradovate trading mode page did not clear after clicking Access Simulation")
+
+    def is_trading_ticket_open(self) -> bool:
+        if self.page is None:
+            return False
+        try:
+            simple_tab = self.page.get_by_text(re.compile("^simple$", re.I)).count() > 0
+            advanced_tab = self.page.get_by_text(re.compile("^advanced$", re.I)).count() > 0
+            order_type_text = self.page.get_by_text(re.compile("order type", re.I)).count() > 0
+            send_button = self.page.get_by_role("button", name=re.compile("^send$", re.I)).count() > 0
+            detected = (simple_tab and advanced_tab) or order_type_text or send_button
+            print(
+                f"Trading ticket detection | simple_tab={simple_tab} "
+                f"advanced_tab={advanced_tab} order_type_text={order_type_text} "
+                f"send_button={send_button} url={self.page.url}",
+                flush=True,
+            )
+            return detected
+        except Exception:
+            return False
+
+    def maybe_open_trading_ticket(self) -> None:
+        if self.page is None:
+            raise RuntimeError("Browser page is not initialized")
+        if self.is_trading_ticket_open():
+            print("Tradovate trading ticket already open", flush=True)
+            return
+
+        print("Trading ticket not open; attempting to click Trading button...", flush=True)
+
+        if self.is_login_page():
+            print("Tradovate returned to login/welcome state while opening ticket; re-running login flow...", flush=True)
+            self.maybe_login()
+            self.maybe_select_simulation()
+            if self.is_trading_ticket_open():
+                print("Trading ticket became available after re-login", flush=True)
+                return
+
+        direct_candidates = [
+            self.page.get_by_role("button", name=re.compile("^trading$", re.I)),
+            self.page.locator("[aria-label='Trading'], [title='Trading'], [data-tooltip-content='Trading']"),
+        ]
+
+        for candidate in direct_candidates:
+            try:
+                if candidate.count() > 0:
+                    button = candidate.first
+                    button.scroll_into_view_if_needed(timeout=2_000)
+                    button.click(timeout=2_000, force=True)
+                    time.sleep(0.5)
+                    if self.is_trading_ticket_open():
+                        print("Opened trading ticket via direct Trading selector", flush=True)
+                        return
+            except Exception as exc:
+                print(f"Direct Trading selector failed, trying fallback: {exc}", flush=True)
+
+        # Fallback: hover/click top-left controls until the Trading tooltip appears.
+        buttons = self.page.locator("button, [role='button']")
+        button_count = min(buttons.count(), 20)
+        for idx in range(button_count):
+            candidate = buttons.nth(idx)
+            try:
+                box = candidate.bounding_box()
+                if not box:
+                    continue
+                if box["x"] > 500 or box["y"] > 250:
+                    continue
+                candidate.hover(timeout=1_000)
+                time.sleep(0.2)
+                if self.page.get_by_text(re.compile("^trading$", re.I)).count() > 0:
+                    candidate.click(timeout=2_000, force=True)
+                    time.sleep(0.5)
+                    if self.is_trading_ticket_open():
+                        print("Opened trading ticket via tooltip fallback", flush=True)
+                        return
+            except Exception:
+                continue
+
+        # Give Tradovate a moment to fully restore the main shell after login /
+        # simulation changes before we start coordinate clicks.
+        time.sleep(1.0)
+
+        # Final fallback: Tradovate's top-left Trading control is canvas-like and
+        # may not expose a usable DOM selector. Click a wider cluster around the
+        # icon area, retrying in passes.
+        try:
+            print("Falling back to coordinate click for top-left Trading control...", flush=True)
+            candidate_points = [
+                (94, 28), (108, 28), (122, 28), (136, 28), (150, 28),
+                (94, 44), (108, 44), (122, 44), (136, 44), (150, 44),
+                (94, 60), (108, 60), (122, 60), (136, 60), (150, 60),
+                (94, 76), (108, 76), (122, 76), (136, 76), (150, 76),
+            ]
+            for attempt in range(2):
+                print(f"Trading control coordinate pass {attempt + 1}", flush=True)
+                for x, y in candidate_points:
+                    print(f"Trying Trading control click at ({x}, {y})", flush=True)
+                    self.page.mouse.move(x, y)
+                    time.sleep(0.15)
+                    self.page.mouse.click(x, y)
+                    time.sleep(1.0)
+                    if self.is_login_page():
+                        print("Coordinate click landed on login/welcome; re-running login flow...", flush=True)
+                        self.maybe_login()
+                        self.maybe_select_simulation()
+                        time.sleep(1.0)
+                        continue
+                    if self.is_trading_ticket_open():
+                        print("Opened trading ticket via coordinate fallback", flush=True)
+                        return
+                time.sleep(0.8)
+        except Exception as exc:
+            print(f"Coordinate fallback failed: {exc}", flush=True)
+
+        raise RuntimeError("Could not open standardized Tradovate trading ticket from the Trading button")
+
+    def _find_visible_text_input(self):
+        if self.page is None:
+            raise RuntimeError("Browser page is not initialized")
+        inputs = self._ticket_modal().locator("input")
+        for idx in range(inputs.count()):
+            candidate = inputs.nth(idx)
+            try:
+                if not candidate.is_visible():
+                    continue
+                if (candidate.get_attribute("type") or "").lower() == "password":
+                    continue
+                return candidate
+            except Exception:
+                continue
+        raise RuntimeError("Could not find visible text input in Tradovate ticket")
+
+    def _ticket_modal(self):
+        if self.page is None:
+            raise RuntimeError("Browser page is not initialized")
+        modal_candidates = self.page.locator("[data-testid='order-ticket-modal'], [role='dialog']")
+        count = modal_candidates.count()
+        if count > 0:
+            return modal_candidates.nth(count - 1)
+        send_button = self.page.get_by_role("button", name=re.compile("^send$", re.I)).first
+        if send_button.count() > 0:
+            return send_button.locator("xpath=ancestor::*[@role='dialog' or @data-testid='order-ticket-modal'][1]")
+        raise RuntimeError("Could not find Tradovate order ticket modal")
+
+    def _click_trade_side(self, side: str) -> None:
+        if self.page is None:
+            raise RuntimeError("Browser page is not initialized")
+        modal = self._ticket_modal()
+        button_name = "Buy" if side.upper() == "LONG" else "Sell"
+        candidates = [
+            modal.get_by_role("button", name=re.compile(f"^{button_name}$", re.I)),
+            modal.get_by_text(re.compile(f"^{button_name}$", re.I)),
+        ]
+        for candidate in candidates:
+            try:
+                if candidate.count() > 0:
+                    candidate.first.click(timeout=2_000, force=True)
+                    print(f"Selected trade side: {button_name}", flush=True)
+                    return
+            except Exception:
+                continue
+        raise RuntimeError(f"Could not select {button_name} button in Tradovate ticket")
+
+    def _set_quantity(self, quantity: int) -> None:
+        if self.page is None:
+            raise RuntimeError("Browser page is not initialized")
+        modal = self._ticket_modal()
+        target = str(quantity)
+        current_value = ""
+
+        # First try a true input path if Tradovate exposes one.
+        qty_input = modal.locator("input[placeholder='Select value']").first
+        if qty_input.count() > 0:
+            try:
+                qty_input.click(timeout=2_000, force=True)
+                time.sleep(0.2)
+                try:
+                    qty_input.press("Meta+A")
+                    qty_input.press("Backspace")
+                except Exception:
+                    pass
+                self.page.keyboard.type(target, delay=60)
+                time.sleep(0.2)
+                current_value = (qty_input.input_value() or "").strip()
+                if current_value == target:
+                    print(f"Selected quantity via keyboard typing: {quantity}", flush=True)
+                    return
+            except Exception:
+                pass
+
+        # Fallback: treat quantity as a custom combo box anchored to the QTY label.
+        qty_label = modal.get_by_text(re.compile("^QTY$", re.I)).first
+        if qty_label.count() == 0:
+            raise RuntimeError("Could not find QTY label in Tradovate ticket")
+
+        label_box = qty_label.bounding_box()
+        if not label_box:
+            raise RuntimeError("Could not measure QTY label in Tradovate ticket")
+
+        # Click into the quantity field area to the right of the QTY label.
+        field_x = label_box["x"] + 150
+        field_y = label_box["y"] + 6
+        arrow_x = label_box["x"] + 315
+        arrow_y = label_box["y"] + 6
+
+        # Try typing directly into the field first.
+        print(f"Trying quantity field click at ({field_x:.0f}, {field_y:.0f})", flush=True)
+        self.page.mouse.click(field_x, field_y)
+        time.sleep(0.2)
+        self.page.keyboard.press("Meta+A")
+        self.page.keyboard.press("Backspace")
+        self.page.keyboard.type(target, delay=60)
+        time.sleep(0.3)
+
+        # If the field is still showing Select, open the picker and choose the option.
+        if modal.get_by_text(re.compile("^Select$", re.I)).count() > 0:
+            print("Typed quantity did not replace Select; opening quantity picker...", flush=True)
+            self.page.mouse.click(arrow_x, arrow_y)
+            time.sleep(0.5)
+            option_candidates = [
+                self.page.get_by_role("option", name=re.compile(f"^{quantity}$")),
+                self.page.get_by_text(re.compile(f"^{quantity}$")),
+            ]
+            for candidate in option_candidates:
+                try:
+                    if candidate.count() > 0:
+                        candidate.last.click(timeout=2_000, force=True)
+                        print(f"Selected quantity via picker: {quantity}", flush=True)
+                        return
+                except Exception:
+                    continue
+            raise RuntimeError(f"Could not select quantity {quantity} from Tradovate picker")
+
+        print(f"Selected quantity via field typing: {quantity}", flush=True)
+
+    def _set_order_type(self, order_type: str) -> None:
+        if self.page is None:
+            raise RuntimeError("Browser page is not initialized")
+        modal = self._ticket_modal()
+        order_label = modal.get_by_text(re.compile("^ORDER TYPE$", re.I)).first
+        if order_label.count() == 0:
+            raise RuntimeError("Could not find ORDER TYPE label in Tradovate ticket")
+
+        label_box = order_label.bounding_box()
+        if not label_box:
+            raise RuntimeError("Could not measure ORDER TYPE label in Tradovate ticket")
+
+        field_x = label_box["x"] + 155
+        field_y = label_box["y"] + 8
+        arrow_x = label_box["x"] + 315
+        arrow_y = label_box["y"] + 8
+
+        print(f"Trying order type field click at ({field_x:.0f}, {field_y:.0f})", flush=True)
+        self.page.mouse.click(field_x, field_y)
+        time.sleep(0.4)
+
+        def order_type_selected() -> bool:
+            if order_type.upper() == "STOP":
+                try:
+                    if modal.get_by_text(re.compile("^PRICE$", re.I)).count() > 0:
+                        return True
+                except Exception:
+                    pass
+            try:
+                field_text = modal.locator("input").evaluate_all(
+                    """els => els.map(e => (e.value || e.getAttribute('value') || '').trim())"""
+                )
+                for value in field_text:
+                    if str(value).strip().upper() == order_type.upper():
+                        return True
+            except Exception:
+                pass
+            try:
+                return modal.get_by_text(re.compile(f"^{re.escape(order_type)}$", re.I)).count() > 0 and modal.get_by_text(re.compile("^ORDER TYPE$", re.I)).count() > 0
+            except Exception:
+                return False
+
+        # For Tradovate STOP orders, keep the path brutally simple:
+        # 1. click the MARKET order-type field body
+        # 2. native-click the exact STOP screen coordinate
+        # 3. verify PRICE row appears
+        if order_type.upper() == "STOP":
+            try:
+                print("Trying literal STOP text / clickable-parent selector", flush=True)
+                self.page.mouse.click(field_x, field_y)
+                time.sleep(0.35)
+                if self._dom_select_stop_menu_item(field_y):
+                    time.sleep(0.6)
+                    if order_type_selected():
+                        print("Selected order type via literal STOP selector", flush=True)
+                        return
+            except Exception:
+                pass
+
+        if order_type.upper() == "STOP" and self.stop_menu_click_x is not None and self.stop_menu_click_y is not None:
+            try:
+                native_points = [(self.stop_menu_click_x, self.stop_menu_click_y)]
+                screen_h = self._screen_height()
+                if screen_h is not None:
+                    converted_y = screen_h - self.stop_menu_click_y
+                    if abs(converted_y - self.stop_menu_click_y) > 1:
+                        native_points.append((self.stop_menu_click_x, converted_y))
+
+                print(
+                    f"Trying direct STOP native click path with field ({field_x:.0f}, {field_y:.0f}) and stop candidates "
+                    f"{[(int(x), int(y)) for x, y in native_points]}",
+                    flush=True,
+                )
+                self.page.mouse.click(field_x, field_y)
+                time.sleep(0.45)
+                for stop_x, stop_y in native_points:
+                    print(f"Trying native STOP click candidate ({int(stop_x)}, {int(stop_y)})", flush=True)
+                    if not self._native_click_point(stop_x, stop_y):
+                        continue
+                    time.sleep(0.7)
+                    if order_type_selected():
+                        print(f"Selected order type via direct STOP native click path at ({int(stop_x)}, {int(stop_y)})", flush=True)
+                        return
+                    self.page.mouse.click(field_x, field_y)
+                    time.sleep(0.30)
+            except Exception:
+                pass
+
+        option_candidates = [
+            self.page.get_by_role("option", name=re.compile(f"^{re.escape(order_type)}$", re.I)),
+            self.page.get_by_text(re.compile(f"^{re.escape(order_type)}$", re.I)),
+        ]
+        for candidate in option_candidates:
+            try:
+                if candidate.count() > 0:
+                    candidate.last.click(timeout=1_000, force=True)
+                    time.sleep(0.3)
+                    if order_type_selected():
+                        print(f"Selected order type: {order_type}", flush=True)
+                        return
+            except Exception:
+                continue
+
+        print(f"Direct click did not stick for order type {order_type}; trying keyboard fallback", flush=True)
+        order_sequence = ["MARKET", "LIMIT", "STOP", "STOP LIMIT", "TRL STOP", "TRL STP LMT"]
+        try:
+            click_x = arrow_x if order_type.upper() == "STOP" else field_x
+            click_y = arrow_y if order_type.upper() == "STOP" else field_y
+            print(f"Trying order type keyboard anchor click at ({click_x:.0f}, {click_y:.0f})", flush=True)
+            self.page.mouse.click(click_x, click_y)
+            time.sleep(0.2)
+            # Tradovate consistently opens from MARKET in this ticket flow.
+            # For STOP specifically, the reliable path is 3x ArrowDown then Enter.
+            if order_type.upper() == "STOP":
+                for _ in range(3):
+                    self.page.keyboard.press("ArrowDown")
+                    time.sleep(0.10)
+            else:
+                for _ in range(8):
+                    self.page.keyboard.press("ArrowUp")
+                    time.sleep(0.05)
+                if order_type.upper() not in order_sequence:
+                    raise RuntimeError(f"Unsupported order type sequence for {order_type}")
+                target_index = order_sequence.index(order_type.upper())
+                for _ in range(target_index):
+                    self.page.keyboard.press("ArrowDown")
+                    time.sleep(0.08)
+            self.page.keyboard.press("Enter")
+            time.sleep(0.5)
+            if order_type_selected():
+                print(f"Selected order type via keyboard fallback: {order_type}", flush=True)
+                return
+        except Exception:
+            pass
+
+        # Last fallback for STOP specifically: click the field, send 3x ArrowDown,
+        # then Enter without relying on DOM option selection.
+        if order_type.upper() == "STOP":
+            try:
+                print("Trying explicit STOP shortcut: ArrowDown x3 then Enter", flush=True)
+                self.page.mouse.click(arrow_x, arrow_y)
+                time.sleep(0.2)
+                self.page.keyboard.press("ArrowDown")
+                time.sleep(0.10)
+                self.page.keyboard.press("ArrowDown")
+                time.sleep(0.10)
+                self.page.keyboard.press("ArrowDown")
+                time.sleep(0.10)
+                self.page.keyboard.press("Enter")
+                time.sleep(0.5)
+                if order_type_selected():
+                    print("Selected order type via explicit STOP shortcut", flush=True)
+                    return
+            except Exception:
+                pass
+
+        if order_type.upper() == "STOP":
+            try:
+                self.page.mouse.click(arrow_x, arrow_y)
+                time.sleep(0.25)
+                if self._native_stop_order_shortcut() and order_type_selected():
+                    print("Selected order type via native macOS STOP shortcut", flush=True)
+                    return
+            except Exception:
+                pass
+
+        # Final fallback: Tradovate's order type menu has a fixed vertical
+        # layout. Click the STOP row directly relative to the order-type field.
+        if order_type.upper() == "STOP":
+            try:
+                if self.stop_menu_click_x is not None and self.stop_menu_click_y is not None:
+                    print(
+                        f"Trying calibrated STOP menu click at ({self.stop_menu_click_x:.0f}, {self.stop_menu_click_y:.0f})",
+                        flush=True,
+                    )
+                    self.page.mouse.click(arrow_x, arrow_y)
+                    time.sleep(0.35)
+                    self.page.mouse.move(self.stop_menu_click_x, self.stop_menu_click_y)
+                    time.sleep(0.20)
+                    self.page.mouse.down()
+                    time.sleep(0.08)
+                    self.page.mouse.up()
+                    time.sleep(0.6)
+                    if order_type_selected():
+                        print("Selected order type via calibrated STOP menu click", flush=True)
+                        return
+            except Exception:
+                pass
+
+        if order_type.upper() == "STOP":
+            try:
+                if self.stop_menu_click_x is not None and self.stop_menu_click_y is not None:
+                    print(
+                        f"Trying native cliclick STOP menu click at screen ({self.stop_menu_click_x:.0f}, {self.stop_menu_click_y:.0f})",
+                        flush=True,
+                    )
+                    self.page.mouse.click(arrow_x, arrow_y)
+                    time.sleep(0.25)
+                    self._activate_chromium()
+                    time.sleep(0.2)
+                    if self._native_cliclick(f"c:{int(self.stop_menu_click_x)},{int(self.stop_menu_click_y)}"):
+                        time.sleep(0.6)
+                        if order_type_selected():
+                            print("Selected order type via native cliclick STOP menu click", flush=True)
+                            return
+            except Exception:
+                pass
+
+        if order_type.upper() == "STOP":
+            try:
+                print("Trying visible STOP label click fallback", flush=True)
+                self.page.mouse.click(arrow_x, arrow_y)
+                time.sleep(0.25)
+                stop_labels = self.page.get_by_text(re.compile("^STOP$", re.I))
+                for idx in range(stop_labels.count()):
+                    try:
+                        stop_label = stop_labels.nth(idx)
+                        box = stop_label.bounding_box()
+                        if not box:
+                            continue
+                        # Ignore the closed field value and focus on the open menu row below it.
+                        if box["y"] <= field_y + 20:
+                            continue
+                        center_x = box["x"] + box["width"] / 2
+                        center_y = box["y"] + box["height"] / 2
+                        print(f"Trying visible STOP label click at ({center_x:.0f}, {center_y:.0f})", flush=True)
+                        self.page.mouse.click(center_x, center_y)
+                        time.sleep(0.4)
+                        if order_type_selected():
+                            print("Selected order type via visible STOP label click", flush=True)
+                            return
+                        self.page.mouse.click(arrow_x, arrow_y)
+                        time.sleep(0.2)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        # Final fallback: Tradovate's order type menu has a fixed vertical
+        # layout. Click the STOP row directly relative to the order-type field.
+        if order_type.upper() == "STOP":
+            try:
+                print("Trying direct STOP menu-row click fallback", flush=True)
+                self.page.mouse.click(arrow_x, arrow_y)
+                time.sleep(0.25)
+                stop_row_points = [
+                    (field_x, field_y + 126),
+                    (field_x - 24, field_y + 126),
+                    (field_x + 24, field_y + 126),
+                    (field_x, field_y + 112),
+                    (field_x, field_y + 140),
+                ]
+                for menu_x, menu_y in stop_row_points:
+                    print(f"Trying STOP menu-row click at ({menu_x:.0f}, {menu_y:.0f})", flush=True)
+                    self.page.mouse.click(menu_x, menu_y)
+                    time.sleep(0.4)
+                    if order_type_selected():
+                        print("Selected order type via direct STOP menu-row click", flush=True)
+                        return
+                    # Re-open the menu before trying another row point.
+                    self.page.mouse.click(arrow_x, arrow_y)
+                    time.sleep(0.2)
+            except Exception:
+                pass
+
+        raise RuntimeError(f"Could not select order type {order_type} in Tradovate ticket")
+
+    def _set_price(self, price_text: str) -> None:
+        if self.page is None:
+            raise RuntimeError("Browser page is not initialized")
+        modal = self._ticket_modal()
+        price_label = modal.get_by_text(re.compile("^PRICE$", re.I)).first
+        if price_label.count() == 0:
+            raise RuntimeError("Could not find PRICE label in Tradovate ticket")
+
+        label_box = price_label.bounding_box()
+        if not label_box:
+            raise RuntimeError("Could not measure PRICE label in Tradovate ticket")
+
+        field_x = label_box["x"] + 150
+        field_y = label_box["y"] + 8
+
+        print(f"Trying price field click at ({field_x:.0f}, {field_y:.0f})", flush=True)
+        self.page.mouse.click(field_x, field_y)
+        time.sleep(0.2)
+        self.page.keyboard.press("Meta+A")
+        self.page.keyboard.press("Backspace")
+        self.page.keyboard.type(price_text, delay=50)
+        time.sleep(0.3)
+
+        print(f"Typed stop price: {price_text}", flush=True)
+
+    def prepare_trade_ticket(self, symbol: str, side: str, quantity: int) -> None:
+        if self.page is None:
+            raise RuntimeError("Browser page is not initialized")
+        self.ensure_tradovate_ready()
+        search_input = self._find_visible_text_input()
+        search_input.click(timeout=2_000)
+        search_input.fill(symbol)
+        print(f"Filled symbol search with {symbol}", flush=True)
+        self._click_trade_side(side)
+        self._set_quantity(quantity)
+        print("Prepared Tradovate ticket without sending order", flush=True)
+
+    def prepare_stop_ticket(
+        self,
+        symbol: str,
+        entry_side: str,
+        quantity: int,
+        stop_price: float,
+        tick_size: float,
+    ) -> None:
+        if self.page is None:
+            raise RuntimeError("Browser page is not initialized")
+        self.ensure_tradovate_ready()
+        stop_side = self._opposite_side(entry_side)
+        search_input = self._find_visible_text_input()
+        search_input.click(timeout=2_000)
+        search_input.fill(symbol)
+        print(f"Filled symbol search with {symbol} for stop ticket", flush=True)
+        self._click_trade_side(stop_side)
+        self._set_quantity(quantity)
+        self._set_order_type("STOP")
+        self._set_price(self._format_price(stop_price, tick_size))
+        print("Prepared Tradovate STOP loss ticket without sending order", flush=True)
+
+    def submit_trade_ticket(self) -> None:
+        if self.page is None:
+            raise RuntimeError("Browser page is not initialized")
+        modal = self._ticket_modal()
+        send_button = modal.get_by_role("button", name=re.compile("^send$", re.I)).first
+        if send_button.count() == 0:
+            raise RuntimeError("Could not find Send button in Tradovate ticket")
+        send_button.click(timeout=2_000, force=True)
+        print("Pressed Send on Tradovate ticket", flush=True)
+        time.sleep(1.0)
+
     def execute_job(self, job: dict[str, Any]) -> dict[str, Any]:
         self.ensure_tradovate_ready()
         request_payload = job["request"]
         plan = job["plan"]
+        ticket_type = str(request_payload.get("ticket_type", "entry")).lower()
 
         result = {
             "mode": "dry_run" if self.dry_run else "live",
+            "ticket_type": ticket_type,
             "symbol": request_payload["symbol"],
             "side": request_payload["side"],
             "quantity": plan["quantity"],
@@ -125,9 +1056,45 @@ class TradovateExecutor:
             "risk_per_contract": plan["risk_per_contract"],
         }
 
+        if self.prepare_only:
+            if ticket_type == "stop_loss":
+                self.prepare_stop_ticket(
+                    symbol=request_payload["symbol"],
+                    entry_side=request_payload["side"],
+                    quantity=plan["quantity"],
+                    stop_price=plan["effective_stop_price"],
+                    tick_size=plan["tick_size"],
+                )
+            else:
+                self.prepare_trade_ticket(
+                    symbol=request_payload["symbol"],
+                    side=request_payload["side"],
+                    quantity=plan["quantity"],
+                )
+            result["mode"] = "prepare_only"
+            return result
+
         if self.dry_run:
             print("DRY RUN execution plan:", result, flush=True)
             return result
+
+        if ticket_type == "stop_loss":
+            self.prepare_stop_ticket(
+                symbol=request_payload["symbol"],
+                entry_side=request_payload["side"],
+                quantity=plan["quantity"],
+                stop_price=plan["effective_stop_price"],
+                tick_size=plan["tick_size"],
+            )
+        else:
+            self.prepare_trade_ticket(
+                symbol=request_payload["symbol"],
+                side=request_payload["side"],
+                quantity=plan["quantity"],
+            )
+        self.submit_trade_ticket()
+        result["mode"] = "live_send"
+        return result
 
         # Step-by-step live execution will be added and tested manually:
         # 1. detect logged-out state and log in if needed
@@ -145,19 +1112,40 @@ def main() -> None:
     worker_id = os.getenv("WORKER_ID", "mac-worker")
     poll_seconds = float(os.getenv("POLL_SECONDS", "2"))
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
+    prepare_only = os.getenv("PREPARE_ONLY", "true").lower() == "true"
     tradovate_url = os.getenv("TRADOVATE_URL", "https://trader.tradovate.com/")
     user_data_dir = os.environ["PLAYWRIGHT_USER_DATA_DIR"]
     tradovate_username = os.getenv("TRADOVATE_USERNAME")
     tradovate_password = os.getenv("TRADOVATE_PASSWORD")
+    stop_menu_click_x = float(os.getenv("STOP_MENU_CLICK_X", "757"))
+    stop_menu_click_y = float(os.getenv("STOP_MENU_CLICK_Y", "515"))
 
+    print(
+        f"Starting worker {worker_id} | dry_run={dry_run} | prepare_only={prepare_only} | poll_seconds={poll_seconds} "
+        f"| stop_menu_click=({stop_menu_click_x:.0f}, {stop_menu_click_y:.0f})",
+        flush=True,
+    )
     railway = RailwayClient(base_url, worker_id)
-    executor = TradovateExecutor(tradovate_url, user_data_dir, dry_run, tradovate_username, tradovate_password)
+    executor = TradovateExecutor(
+        tradovate_url,
+        user_data_dir,
+        dry_run,
+        tradovate_username,
+        tradovate_password,
+        prepare_only,
+        stop_menu_click_x,
+        stop_menu_click_y,
+    )
     executor.start()
 
     try:
         while True:
+            executor.maybe_login()
+            executor.maybe_select_simulation()
+            executor.maybe_open_trading_ticket()
             job = railway.claim_next_job()
             if job is None:
+                print("No pending jobs. Polling again soon...", flush=True)
                 time.sleep(poll_seconds)
                 continue
 

@@ -1,0 +1,5 @@
+playwright==1.54.0
+python-dotenv==1.2.1
+httpx==0.28.1
+pyobjc-framework-Cocoa==11.1
+pyobjc-framework-Quartz==11.1

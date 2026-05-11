@@ -1,10 +1,12 @@
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
+from html import escape
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Form, HTTPException, Query
+from fastapi.responses import HTMLResponse, RedirectResponse
 from twilio.rest import Client
 
 load_dotenv()
@@ -14,6 +16,14 @@ app = FastAPI(title="TradingView Alert Bridge")
 last_alert: dict[str, Any] | None = None
 last_delivery_by_key: dict[str, datetime] = {}
 jobs_by_id: dict[str, dict[str, Any]] = {}
+positions_by_id: dict[str, dict[str, Any]] = {}
+runtime_settings: dict[str, Any] = {
+    "execution_enabled": os.getenv("EXECUTION_ENABLED", "true").lower() == "true",
+    "max_open_positions": int(os.getenv("MAX_OPEN_POSITIONS", "2")),
+    "min_risk_dollars": float(os.getenv("MIN_RISK_DOLLARS", "300")),
+    "max_risk_dollars": float(os.getenv("MAX_RISK_DOLLARS", "500")),
+    "auto_submit_stop_loss": os.getenv("AUTO_SUBMIT_STOP_LOSS", "true").lower() == "true",
+}
 
 PRODUCT_SPECS: dict[str, dict[str, float]] = {
     "MES": {"point_value": 5.0, "tick_value": 1.25, "tick_size": 0.25},
@@ -25,6 +35,14 @@ PRODUCT_SPECS: dict[str, dict[str, float]] = {
     "MNG": {"point_value": 1000.0, "tick_value": 1.0, "tick_size": 0.001},
 }
 
+ACTIVE_POSITION_STATUSES = {
+    "pending_entry",
+    "awaiting_stop",
+    "protected",
+    "open_unprotected",
+    "stop_failed",
+}
+
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -32,6 +50,119 @@ def now_utc() -> datetime:
 
 def now_iso() -> str:
     return now_utc().isoformat()
+
+
+def get_runtime_settings() -> dict[str, Any]:
+    return {
+        "execution_enabled": bool(runtime_settings["execution_enabled"]),
+        "max_open_positions": int(runtime_settings["max_open_positions"]),
+        "min_risk_dollars": float(runtime_settings["min_risk_dollars"]),
+        "max_risk_dollars": float(runtime_settings["max_risk_dollars"]),
+        "auto_submit_stop_loss": bool(runtime_settings["auto_submit_stop_loss"]),
+    }
+
+
+def is_entry_job(request_payload: dict[str, Any]) -> bool:
+    return str(request_payload.get("ticket_type", "entry")).lower() != "stop_loss"
+
+
+def active_positions() -> list[dict[str, Any]]:
+    return [
+        position for position in positions_by_id.values()
+        if position["status"] in ACTIVE_POSITION_STATUSES
+    ]
+
+
+def validate_risk_limits(request_payload: dict[str, Any]) -> None:
+    settings = get_runtime_settings()
+    risk_dollars = float(request_payload["risk_dollars"])
+    if risk_dollars < settings["min_risk_dollars"] or risk_dollars > settings["max_risk_dollars"]:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"risk_dollars must be between {settings['min_risk_dollars']:.0f} "
+                f"and {settings['max_risk_dollars']:.0f}"
+            ),
+        )
+
+
+def validate_trade_capacity(request_payload: dict[str, Any]) -> None:
+    if not is_entry_job(request_payload):
+        return
+    settings = get_runtime_settings()
+    active_count = len(active_positions())
+    if active_count >= settings["max_open_positions"]:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Active trade limit reached ({active_count}/{settings['max_open_positions']}). "
+                "Close a position before opening another."
+            ),
+        )
+
+
+def build_position_from_job(job: dict[str, Any]) -> dict[str, Any]:
+    request_payload = job["request"]
+    plan = job["plan"]
+    position_id = str(uuid.uuid4())
+    return {
+        "position_id": position_id,
+        "status": "pending_entry",
+        "created_at": now_iso(),
+        "opened_at": None,
+        "closed_at": None,
+        "close_reason": None,
+        "symbol": request_payload["symbol"],
+        "side": request_payload["side"],
+        "quantity": plan["quantity"],
+        "entry_price": plan["entry_price"],
+        "effective_stop_price": plan["effective_stop_price"],
+        "risk_dollars": plan["risk_dollars"],
+        "risk_per_contract": plan["risk_per_contract"],
+        "source_job_id": job["job_id"],
+        "stop_job_id": None,
+        "entry_result": None,
+        "stop_result": None,
+    }
+
+
+def get_position_for_job(job_id: str) -> dict[str, Any] | None:
+    for position in positions_by_id.values():
+        if position.get("source_job_id") == job_id or position.get("stop_job_id") == job_id:
+            return position
+    return None
+
+
+def cancel_related_pending_jobs(position_id: str) -> None:
+    position = positions_by_id[position_id]
+    related_job_ids = {position.get("source_job_id"), position.get("stop_job_id")}
+    for related_job_id in related_job_ids:
+        if not related_job_id:
+            continue
+        job = jobs_by_id.get(related_job_id)
+        if job is None:
+            continue
+        if job["status"] in {"pending", "claimed"}:
+            job["status"] = "cancelled"
+            job["cancelled_at"] = now_iso()
+            job["failure_reason"] = "Cancelled due to manual position close"
+
+
+def queue_stop_loss_job_for_position(position: dict[str, Any], entry_job: dict[str, Any]) -> dict[str, Any]:
+    stop_request = dict(entry_job["request"])
+    stop_request["ticket_type"] = "stop_loss"
+    stop_request["linked_position_id"] = position["position_id"]
+    stop_request["execute"] = True
+    stop_job = create_execution_job(stop_request, source="auto_stop_loss", enforce_entry_guards=False)
+    position["stop_job_id"] = stop_job["job_id"]
+    position["status"] = "awaiting_stop"
+    return stop_job
+
+
+def render_bool_badge(value: bool, true_label: str, false_label: str) -> str:
+    label = true_label if value else false_label
+    color = "#15803d" if value else "#b91c1c"
+    return f"<span style='color:{color};font-weight:700'>{escape(label)}</span>"
 
 
 def build_message(payload: dict[str, Any]) -> str:
@@ -198,7 +329,17 @@ def compute_execution_plan(request_payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def create_execution_job(request_payload: dict[str, Any], source: str) -> dict[str, Any]:
+def create_execution_job(
+    request_payload: dict[str, Any],
+    source: str,
+    *,
+    enforce_entry_guards: bool = True,
+) -> dict[str, Any]:
+    if enforce_entry_guards and not runtime_settings["execution_enabled"] and is_entry_job(request_payload):
+        raise HTTPException(status_code=409, detail="Execution is currently disabled")
+    if enforce_entry_guards:
+        validate_risk_limits(request_payload)
+        validate_trade_capacity(request_payload)
     plan = compute_execution_plan(request_payload)
     job_id = str(uuid.uuid4())
     job = {
@@ -215,6 +356,10 @@ def create_execution_job(request_payload: dict[str, Any], source: str) -> dict[s
         "plan": plan,
     }
     jobs_by_id[job_id] = job
+    if is_entry_job(request_payload):
+        position = build_position_from_job(job)
+        positions_by_id[position["position_id"]] = position
+        job["position_id"] = position["position_id"]
     return job
 
 
@@ -270,6 +415,12 @@ def list_execution_jobs() -> dict[str, Any]:
     return {"jobs": jobs}
 
 
+@app.get("/positions")
+def list_positions() -> dict[str, Any]:
+    positions = sorted(positions_by_id.values(), key=lambda position: position["created_at"], reverse=True)
+    return {"positions": positions, "active_count": len(active_positions()), "settings": get_runtime_settings()}
+
+
 @app.get("/execution/jobs/next")
 def claim_next_execution_job(worker_id: str = Query(...)) -> dict[str, Any]:
     job = get_next_pending_job()
@@ -289,6 +440,33 @@ def complete_execution_job(job_id: str, payload: dict[str, Any]) -> dict[str, An
     job["status"] = "completed"
     job["completed_at"] = now_iso()
     job["result"] = payload
+    position = get_position_for_job(job_id)
+    request_payload = job["request"]
+    ticket_type = str(request_payload.get("ticket_type", "entry")).lower()
+
+    if position is not None and ticket_type != "stop_loss":
+        position["entry_result"] = payload
+        mode = str(payload.get("mode", ""))
+        if mode == "live_send":
+            position["opened_at"] = now_iso()
+            if runtime_settings["auto_submit_stop_loss"]:
+                stop_job = queue_stop_loss_job_for_position(position, job)
+                job["auto_stop_job"] = stop_job["job_id"]
+            else:
+                position["status"] = "open_unprotected"
+        elif mode == "prepare_only":
+            position["status"] = "staged_entry"
+        else:
+            position["status"] = "entry_completed"
+
+    if position is not None and ticket_type == "stop_loss":
+        position["stop_result"] = payload
+        mode = str(payload.get("mode", ""))
+        if mode == "live_send":
+            position["status"] = "protected"
+        elif mode == "prepare_only":
+            position["status"] = "staged_stop"
+
     return {"ok": True, "job": job}
 
 
@@ -301,7 +479,189 @@ def fail_execution_job(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     job["failed_at"] = now_iso()
     job["failure_reason"] = payload.get("reason", "unknown failure")
     job["result"] = payload
+    position = get_position_for_job(job_id)
+    if position is not None:
+        ticket_type = str(job["request"].get("ticket_type", "entry")).lower()
+        if ticket_type == "stop_loss":
+            position["status"] = "stop_failed"
+            position["stop_result"] = payload
+        else:
+            position["status"] = "entry_failed"
+            position["entry_result"] = payload
     return {"ok": True, "job": job}
+
+
+@app.post("/positions/{position_id}/close")
+def close_position(position_id: str, reason: str = Query("manual_close")) -> dict[str, Any]:
+    position = positions_by_id.get(position_id)
+    if position is None:
+        raise HTTPException(status_code=404, detail="Position not found")
+    position["status"] = "closed"
+    position["closed_at"] = now_iso()
+    position["close_reason"] = reason
+    cancel_related_pending_jobs(position_id)
+    return {"ok": True, "position": position}
+
+
+def render_dashboard_html() -> str:
+    settings = get_runtime_settings()
+    positions = sorted(positions_by_id.values(), key=lambda position: position["created_at"], reverse=True)
+    jobs = sorted(jobs_by_id.values(), key=lambda job: job["created_at"], reverse=True)[:20]
+    active_count = len(active_positions())
+
+    position_rows = []
+    for position in positions:
+        close_button = ""
+        if position["status"] in ACTIVE_POSITION_STATUSES:
+            close_button = (
+                f"<form method='post' action='/dashboard/positions/{escape(position['position_id'])}/close' style='display:inline'>"
+                "<button type='submit'>Mark Closed</button>"
+                "</form>"
+            )
+        position_rows.append(
+            "<tr>"
+            f"<td>{escape(position['position_id'][:8])}</td>"
+            f"<td>{escape(position['symbol'])}</td>"
+            f"<td>{escape(position['side'])}</td>"
+            f"<td>{position['quantity']}</td>"
+            f"<td>{position['risk_dollars']:.2f}</td>"
+            f"<td>{position['effective_stop_price']:.5f}</td>"
+            f"<td>{escape(position['status'])}</td>"
+            f"<td>{escape(position['created_at'])}</td>"
+            f"<td>{escape(position['opened_at'] or '-')}</td>"
+            f"<td>{escape(position['closed_at'] or '-')}</td>"
+            f"<td>{close_button}</td>"
+            "</tr>"
+        )
+
+    job_rows = []
+    for job in jobs:
+        job_rows.append(
+            "<tr>"
+            f"<td>{escape(job['job_id'][:8])}</td>"
+            f"<td>{escape(str(job['request'].get('ticket_type', 'entry')))}</td>"
+            f"<td>{escape(job['request'].get('symbol', ''))}</td>"
+            f"<td>{escape(job['request'].get('side', ''))}</td>"
+            f"<td>{escape(job['status'])}</td>"
+            f"<td>{escape(str(job.get('position_id', '-'))[:8])}</td>"
+            f"<td>{escape(job['created_at'])}</td>"
+            "</tr>"
+        )
+
+    position_body = "".join(position_rows) or "<tr><td colspan='11'>No positions yet.</td></tr>"
+    job_body = "".join(job_rows) or "<tr><td colspan='7'>No jobs yet.</td></tr>"
+
+    return f"""
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset='utf-8' />
+        <title>Trade Control</title>
+        <style>
+          body {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background:#0b1020; color:#e5e7eb; margin:0; padding:24px; }}
+          h1, h2 {{ margin:0 0 12px 0; }}
+          .grid {{ display:grid; grid-template-columns: 1fr 1fr; gap:20px; margin-bottom:24px; }}
+          .card {{ background:#121933; border:1px solid #26304d; border-radius:14px; padding:16px; }}
+          label {{ display:block; margin:8px 0 4px; }}
+          input, select {{ width:100%; padding:8px; background:#0f172a; color:#e5e7eb; border:1px solid #334155; border-radius:8px; }}
+          button {{ padding:8px 12px; border-radius:8px; border:none; background:#2563eb; color:white; cursor:pointer; }}
+          table {{ width:100%; border-collapse: collapse; }}
+          th, td {{ border-bottom:1px solid #26304d; padding:8px; text-align:left; vertical-align:top; }}
+          .muted {{ color:#94a3b8; }}
+          .wide {{ grid-column: 1 / -1; }}
+        </style>
+      </head>
+      <body>
+        <h1>Trade Control Dashboard</h1>
+        <p class='muted'>Railway is acting as the source of truth for risk gating, active trade count, and stop orchestration.</p>
+        <div class='grid'>
+          <section class='card'>
+            <h2>Runtime Settings</h2>
+            <p>Execution: {render_bool_badge(settings['execution_enabled'], 'Enabled', 'Disabled')}</p>
+            <p>Auto stop-loss: {render_bool_badge(settings['auto_submit_stop_loss'], 'Enabled', 'Disabled')}</p>
+            <p>Active positions: <strong>{active_count}</strong> / {settings['max_open_positions']}</p>
+            <p>Allowed risk per trade: <strong>{settings['min_risk_dollars']:.0f}</strong> to <strong>{settings['max_risk_dollars']:.0f}</strong></p>
+          </section>
+          <section class='card'>
+            <h2>Controls</h2>
+            <form method='post' action='/dashboard/settings'>
+              <label for='execution_enabled'>Execution enabled</label>
+              <select name='execution_enabled' id='execution_enabled'>
+                <option value='true' {"selected" if settings['execution_enabled'] else ""}>true</option>
+                <option value='false' {"selected" if not settings['execution_enabled'] else ""}>false</option>
+              </select>
+              <label for='auto_submit_stop_loss'>Auto-submit stop loss</label>
+              <select name='auto_submit_stop_loss' id='auto_submit_stop_loss'>
+                <option value='true' {"selected" if settings['auto_submit_stop_loss'] else ""}>true</option>
+                <option value='false' {"selected" if not settings['auto_submit_stop_loss'] else ""}>false</option>
+              </select>
+              <label for='max_open_positions'>Max open positions</label>
+              <input type='number' min='1' step='1' name='max_open_positions' id='max_open_positions' value='{settings['max_open_positions']}' />
+              <label for='min_risk_dollars'>Min risk dollars</label>
+              <input type='number' min='0' step='1' name='min_risk_dollars' id='min_risk_dollars' value='{settings['min_risk_dollars']:.0f}' />
+              <label for='max_risk_dollars'>Max risk dollars</label>
+              <input type='number' min='0' step='1' name='max_risk_dollars' id='max_risk_dollars' value='{settings['max_risk_dollars']:.0f}' />
+              <div style='margin-top:12px'><button type='submit'>Save Settings</button></div>
+            </form>
+          </section>
+          <section class='card wide'>
+            <h2>Positions</h2>
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Risk</th><th>Stop</th><th>Status</th><th>Created</th><th>Opened</th><th>Closed</th><th>Action</th>
+                </tr>
+              </thead>
+              <tbody>{position_body}</tbody>
+            </table>
+          </section>
+          <section class='card wide'>
+            <h2>Recent Jobs</h2>
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th><th>Type</th><th>Symbol</th><th>Side</th><th>Status</th><th>Position</th><th>Created</th>
+                </tr>
+              </thead>
+              <tbody>{job_body}</tbody>
+            </table>
+          </section>
+        </div>
+      </body>
+    </html>
+    """
+
+
+@app.get("/", response_class=HTMLResponse)
+def root_dashboard() -> str:
+    return render_dashboard_html()
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard() -> str:
+    return render_dashboard_html()
+
+
+@app.post("/dashboard/settings")
+def update_dashboard_settings(
+    execution_enabled: str = Form(...),
+    auto_submit_stop_loss: str = Form(...),
+    max_open_positions: int = Form(...),
+    min_risk_dollars: float = Form(...),
+    max_risk_dollars: float = Form(...),
+) -> RedirectResponse:
+    runtime_settings["execution_enabled"] = execution_enabled.lower() == "true"
+    runtime_settings["auto_submit_stop_loss"] = auto_submit_stop_loss.lower() == "true"
+    runtime_settings["max_open_positions"] = max(1, int(max_open_positions))
+    runtime_settings["min_risk_dollars"] = max(0.0, float(min_risk_dollars))
+    runtime_settings["max_risk_dollars"] = max(float(max_risk_dollars), runtime_settings["min_risk_dollars"])
+    return RedirectResponse(url="/dashboard", status_code=303)
+
+
+@app.post("/dashboard/positions/{position_id}/close")
+def close_position_from_dashboard(position_id: str) -> RedirectResponse:
+    close_position(position_id, reason="dashboard_manual_close")
+    return RedirectResponse(url="/dashboard", status_code=303)
 
 
 @app.post("/webhook/tradingview")

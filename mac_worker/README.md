@@ -42,6 +42,18 @@ cd /Users/danielntumba/Desktop/markov/tradingview_alert_bridge/mac_worker
 python worker.py
 ```
 
+## Coordinate calibration
+
+If a Tradovate control is visually present but still resists selectors, use the click probe:
+
+```bash
+cd /Users/danielntumba/Desktop/markov/tradingview_alert_bridge/mac_worker
+. .venv/bin/activate
+python calibrate_clicks.py
+```
+
+Then click the live control once. The script will print the click coordinates and target metadata in the terminal.
+
 ## First manual tests
 
 1. Start Railway bridge
@@ -53,6 +65,10 @@ python worker.py
    - logs the planned trade
    - marks the job completed
 
+## macOS permissions
+
+If native keyboard fallback is used for stubborn Tradovate controls, macOS may require Accessibility permission for your terminal app or Codex/Chromium automation path under `System Settings > Privacy & Security > Accessibility`.
+
 ## Next steps after dry run
 
 1. find Trading button selector
@@ -61,3 +77,15 @@ python worker.py
 4. set quantity
 5. send market order
 6. place protective stop
+
+## Mouse overlay
+
+To get live screen coordinates in the top-right corner while hovering Tradovate controls:
+
+```bash
+cd /Users/danielntumba/Desktop/markov/tradingview_alert_bridge/mac_worker
+. .venv/bin/activate
+python mouse_overlay.py
+```
+
+The HUD shows `screen_x`, `screen_y_top`, and `screen_y_bottom`.

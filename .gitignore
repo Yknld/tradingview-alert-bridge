@@ -2,3 +2,9 @@
 .venv/
 __pycache__/
 *.pyc
+.DS_Store
+mac_worker/.playwright-profile/
+mac_worker/.playwright-profile-inspect/
+mac_worker/.playwright-profile-inspect2/
+mac_worker/.playwright-profile-inspect3/
+mac_worker/.playwright-profile-inspect4/

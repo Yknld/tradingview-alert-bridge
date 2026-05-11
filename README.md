@@ -8,6 +8,7 @@ Current flow:
 2. The service triggers phone/SMS notifications.
 3. Optional: the service prepares an execution job.
 4. A local Mac worker can poll Railway for the next job and execute it in Tradovate.
+5. Railway tracks active positions and can auto-queue a protective stop-loss job after a live entry completes.
 
 Initial stack:
 
@@ -34,14 +35,18 @@ Initial stack:
 - `GET /execution/jobs/next?worker_id=...`
 - `POST /execution/jobs/{job_id}/complete`
 - `POST /execution/jobs/{job_id}/fail`
+- `GET /positions`
+- `POST /positions/{position_id}/close`
+- `GET /dashboard`
 - `POST /webhook/tradingview`
 
 ## Notes
 
 - No shared secret
 - No database yet
-- Jobs are currently stored in memory
+- Jobs, positions, and dashboard settings are currently stored in memory
 - Notifications and execution are now separate concerns
+- The dashboard is intended as an operator console for testing and light control
 
 ## Execution plan rules
 
@@ -59,6 +64,14 @@ For an execution request, the service:
    - tick value
    - tick size
    - max contracts
+
+Additional Railway-side guardrails:
+
+1. entry jobs are blocked when execution is disabled
+2. entry jobs are blocked when active positions reach the configured limit
+3. risk dollars are validated against the configured min/max range
+4. a completed live entry can automatically enqueue a `stop_loss` job
+5. a position can be marked closed manually from the dashboard or API
 
 ## Example execution prepare payload
 
