@@ -3,6 +3,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Form, HTTPException, Query
@@ -45,6 +46,8 @@ ACTIVE_POSITION_STATUSES = {
     "stop_failed",
 }
 
+OTTAWA_TZ = ZoneInfo("America/Toronto")
+
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -52,6 +55,19 @@ def now_utc() -> datetime:
 
 def now_iso() -> str:
     return now_utc().isoformat()
+
+
+def format_dashboard_timestamp(timestamp: str | None) -> str:
+    if not timestamp:
+        return "-"
+    try:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return escape(timestamp)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    local_dt = parsed.astimezone(OTTAWA_TZ)
+    return local_dt.strftime("%Y-%m-%d %I:%M:%S %p %Z")
 
 
 def get_runtime_settings() -> dict[str, Any]:
@@ -586,9 +602,9 @@ def render_dashboard_html() -> str:
             f"<td>{position['risk_dollars']:.2f} acct / {position['total_risk_dollars']:.2f} total</td>"
             f"<td>{position['effective_stop_price']:.5f}</td>"
             f"<td>{escape(position['status'])}</td>"
-            f"<td>{escape(position['created_at'])}</td>"
-            f"<td>{escape(position['opened_at'] or '-')}</td>"
-            f"<td>{escape(position['closed_at'] or '-')}</td>"
+            f"<td>{format_dashboard_timestamp(position['created_at'])}</td>"
+            f"<td>{format_dashboard_timestamp(position['opened_at'])}</td>"
+            f"<td>{format_dashboard_timestamp(position['closed_at'])}</td>"
             f"<td>{close_button}</td>"
             "</tr>"
         )
@@ -603,7 +619,7 @@ def render_dashboard_html() -> str:
             f"<td>{escape(job['request'].get('side', ''))}</td>"
             f"<td>{escape(job['status'])}</td>"
             f"<td>{escape(str(job.get('position_id', '-'))[:8])}</td>"
-            f"<td>{escape(job['created_at'])}</td>"
+            f"<td>{format_dashboard_timestamp(job['created_at'])}</td>"
             "</tr>"
         )
 
@@ -633,6 +649,7 @@ def render_dashboard_html() -> str:
       <body>
         <h1>Trade Control Dashboard</h1>
         <p class='muted'>Railway is acting as the source of truth for risk gating, active trade count, and stop orchestration.</p>
+        <p class='muted'>All dashboard times are shown in Ottawa time ({escape(OTTAWA_TZ.key)}).</p>
         <div class='grid'>
           <section class='card'>
             <h2>Runtime Settings</h2>
