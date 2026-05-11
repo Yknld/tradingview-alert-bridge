@@ -320,6 +320,10 @@ def compute_execution_plan(request_payload: dict[str, Any]) -> dict[str, Any]:
     root = normalize_symbol_root(symbol)
     specs = PRODUCT_SPECS[root]
     effective_stop_price = choose_effective_stop(side, entry_price, natural_stop_price, disaster_stop_price)
+    if side == "LONG" and effective_stop_price >= entry_price:
+        raise HTTPException(status_code=400, detail="Effective stop for LONG must be below entry price")
+    if side == "SHORT" and effective_stop_price <= entry_price:
+        raise HTTPException(status_code=400, detail="Effective stop for SHORT must be above entry price")
     stop_distance_points = abs(entry_price - effective_stop_price)
     stop_distance_ticks = stop_distance_points / specs["tick_size"] if specs["tick_size"] > 0 else 0.0
     risk_per_contract = stop_distance_ticks * specs["tick_value"]
@@ -328,6 +332,14 @@ def compute_execution_plan(request_payload: dict[str, Any]) -> dict[str, Any]:
 
     qty_by_risk = int(risk_dollars // risk_per_contract)
     per_account_quantity = max(min(qty_by_risk, max_contracts), 0)
+    if per_account_quantity < 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Risk budget is too small for even 1 contract per account at the computed stop distance. "
+                "Increase risk_dollars, tighten the stop, or reduce mirrored account count."
+            ),
+        )
     quantity = per_account_quantity * mirrored_account_count
 
     return {
