@@ -583,6 +583,8 @@ def render_dashboard_html() -> str:
     jobs = sorted(jobs_by_id.values(), key=lambda job: job["created_at"], reverse=True)[:20]
     active_count = len(active_positions())
     active_contract_count = active_per_account_contracts()
+    max_possible_total_orders = settings["max_open_contracts_per_account"] * settings["mirrored_account_count"]
+    recommended_contract_cap = settings["max_open_positions"] * 3
 
     position_rows = []
     for position in positions:
@@ -643,6 +645,8 @@ def render_dashboard_html() -> str:
           table {{ width:100%; border-collapse: collapse; }}
           th, td {{ border-bottom:1px solid #26304d; padding:8px; text-align:left; vertical-align:top; }}
           .muted {{ color:#94a3b8; }}
+          .help {{ color:#a5b4fc; font-size:14px; line-height:1.45; margin:4px 0 10px; }}
+          .callout {{ background:#0f172a; border:1px solid #334155; border-radius:10px; padding:12px; margin-top:12px; }}
           .wide {{ grid-column: 1 / -1; }}
         </style>
       </head>
@@ -655,10 +659,16 @@ def render_dashboard_html() -> str:
             <h2>Runtime Settings</h2>
             <p>Execution: {render_bool_badge(settings['execution_enabled'], 'Enabled', 'Disabled')}</p>
             <p>Auto stop-loss: {render_bool_badge(settings['auto_submit_stop_loss'], 'Enabled', 'Disabled')}</p>
-            <p>Active positions: <strong>{active_count}</strong> / {settings['max_open_positions']}</p>
-            <p>Open contracts per account: <strong>{active_contract_count}</strong> / <strong>{settings['max_open_contracts_per_account']}</strong></p>
-            <p>Mirrored accounts: <strong>{settings['mirrored_account_count']}</strong></p>
-            <p>Allowed risk per trade: <strong>{settings['min_risk_dollars']:.0f}</strong> to <strong>{settings['max_risk_dollars']:.0f}</strong> per account</p>
+            <p>Trades open now: <strong>{active_count}</strong> / {settings['max_open_positions']}</p>
+            <p>Contracts open now on each prop account: <strong>{active_contract_count}</strong> / <strong>{settings['max_open_contracts_per_account']}</strong></p>
+            <p>Mirrored prop accounts: <strong>{settings['mirrored_account_count']}</strong></p>
+            <p>Allowed risk for each trade on each prop account: <strong>{settings['min_risk_dollars']:.0f}</strong> to <strong>{settings['max_risk_dollars']:.0f}</strong></p>
+            <div class='callout'>
+              <strong>How this works for your setup</strong>
+              <p class='help'>`Mirrored accounts = {settings['mirrored_account_count']}` means every approved trade is duplicated across {settings['mirrored_account_count']} prop accounts.</p>
+              <p class='help'>Example: if Railway sizes a trade at <strong>3 contracts per account</strong>, the worker sends <strong>{3 * settings['mirrored_account_count']} total orders</strong>.</p>
+              <p class='help'>The current contract cap allows up to <strong>{settings['max_open_contracts_per_account']}</strong> contracts on each account, which means up to <strong>{max_possible_total_orders}</strong> total mirrored orders at once.</p>
+            </div>
           </section>
           <section class='card'>
             <h2>Controls</h2>
@@ -673,15 +683,21 @@ def render_dashboard_html() -> str:
                 <option value='true' {"selected" if settings['auto_submit_stop_loss'] else ""}>true</option>
                 <option value='false' {"selected" if not settings['auto_submit_stop_loss'] else ""}>false</option>
               </select>
-              <label for='max_open_positions'>Max open positions</label>
+              <label for='max_open_positions'>Max different trades open at the same time</label>
+              <p class='help'>This is your symbol/setup count. Example: `MES + M2K + MGC = 3` open trades.</p>
               <input type='number' min='1' step='1' name='max_open_positions' id='max_open_positions' value='{settings['max_open_positions']}' />
-              <label for='max_open_contracts_per_account'>Max open contracts per account</label>
+              <label for='max_open_contracts_per_account'>Max total contracts allowed on each prop account</label>
+              <p class='help'>This is a second exposure cap. If one trade uses `3 contracts per account`, that counts as `3` here even though the worker sends double total orders for your mirrored accounts.</p>
+              <p class='help'>If you want up to <strong>{settings['max_open_positions']}</strong> trades and each trade might use up to <strong>3 contracts per account</strong>, set this to at least <strong>{recommended_contract_cap}</strong>.</p>
               <input type='number' min='1' step='1' name='max_open_contracts_per_account' id='max_open_contracts_per_account' value='{settings['max_open_contracts_per_account']}' />
-              <label for='min_risk_dollars'>Min risk dollars</label>
+              <label for='min_risk_dollars'>Smallest allowed risk for one trade on one prop account</label>
+              <p class='help'>If Pine sends a trade risking less than this amount on one account, Railway rejects it.</p>
               <input type='number' min='0' step='1' name='min_risk_dollars' id='min_risk_dollars' value='{settings['min_risk_dollars']:.0f}' />
-              <label for='max_risk_dollars'>Max risk dollars</label>
+              <label for='max_risk_dollars'>Largest allowed risk for one trade on one prop account</label>
+              <p class='help'>If Pine sends a trade risking more than this amount on one account, Railway rejects it.</p>
               <input type='number' min='0' step='1' name='max_risk_dollars' id='max_risk_dollars' value='{settings['max_risk_dollars']:.0f}' />
-              <label for='mirrored_account_count'>Mirrored account count</label>
+              <label for='mirrored_account_count'>How many prop accounts receive the same trade</label>
+              <p class='help'>`2` means Railway sizes the trade once per account, then the worker sends double total orders.</p>
               <input type='number' min='1' step='1' name='mirrored_account_count' id='mirrored_account_count' value='{settings['mirrored_account_count']}' />
               <div style='margin-top:12px'><button type='submit'>Save Settings</button></div>
             </form>
